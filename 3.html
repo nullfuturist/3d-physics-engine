@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Tripod Crash Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: 'Courier New', monospace;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        .controls {
+            position: sticky;
+            top: 0;
+            background: #2a2a2a;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            z-index: 100;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        button {
+            background: #4a9eff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 5px;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #357abd;
+        }
+        .frame {
+            background: #2a2a2a;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            border: 2px solid #4a9eff;
+        }
+        .frame-header {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            color: #4a9eff;
+        }
+        .canvas-container {
+            position: relative;
+            display: inline-block;
+        }
+        canvas {
+            border: 2px solid #555;
+            background: #0a0a0a;
+            display: block;
+            margin-bottom: 15px;
+        }
+        .top-view {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            border: 2px solid #4a9eff;
+            background: rgba(10, 10, 10, 0.8);
+        }
+        .state-info {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            font-size: 12px;
+            line-height: 1.6;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .vertex-info {
+            margin-bottom: 10px;
+            padding: 8px;
+            background: #2a2a2a;
+            border-left: 3px solid #4a9eff;
+        }
+        .broken-edge {
+            color: #ff4444;
+            font-weight: bold;
+        }
+        .stats {
+            color: #88ff88;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <button onclick="nextFrame()">Generate Next Frame</button>
+        <button onclick="autoRun()">Auto Run (10 frames)</button>
+        <button onclick="reset()">Reset</button>
+        <span style="margin-left: 20px;">Frame: <span id="frameCount">0</span></span>
+    </div>
+    <div id="frames"></div>
+
+    <script>
+        // Simulation parameters
+        const GRAVITY = 0.3;
+        const DAMPING = 0.98;
+        const GROUND_Y = 150;
+        const TIME_STEP = 0.016;
+        const VERTEX_RADIUS = 12;
+        const COLLISION_ITERATIONS = 3;
+
+        // Camera settings
+        const CAMERA_DISTANCE = 600;
+        const FOCAL_LENGTH = 500;
+
+        let frameNumber = 0;
+        let vertices = [];
+        let brokenEdges = new Set();
+
+        class Vertex {
+            constructor(id, x, y, z, parentId = null, mass = 1.0, rangeX = 50, rangeY = 50, rangeZ = 50, 
+                        stiffness = 0.8, breakForce = 100, lengthStiffness = 0.0, minimalDisplay = false) {
+                this.id = id;
+                this.x = x;
+                this.y = y;
+                this.z = z;
+                this.vx = 0;
+                this.vy = 0;
+                this.vz = 0;
+                this.parentId = parentId;
+                this.mass = mass;
+                this.rangeX = rangeX;
+                this.rangeY = rangeY;
+                this.rangeZ = rangeZ;
+                this.stiffness = stiffness;
+                this.breakForce = breakForce;
+                this.lengthStiffness = lengthStiffness; // 0 = rigid, 1 = stretchy
+                this.minimalDisplay = minimalDisplay; // Display as small circle regardless of mass
+                this.restX = x;
+                this.restY = y;
+                this.restZ = z;
+                
+                // Calculate rest length to parent
+                if (parentId !== null) {
+                    const parent = vertices.find(v => v.id === parentId);
+                    if (parent) {
+                        const dx = x - parent.x;
+                        const dy = y - parent.y;
+                        const dz = z - parent.z;
+                        this.restLength = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    }
+                } else {
+                    this.restLength = 0;
+                }
+            }
+
+            applyForce(fx, fy, fz) {
+                this.vx += fx / this.mass;
+                this.vy += fy / this.mass;
+                this.vz += fz / this.mass;
+            }
+
+            update() {
+                // Apply gravity
+                this.vy += GRAVITY;
+
+                // Apply velocity
+                this.x += this.vx;
+                this.y += this.vy;
+                this.z += this.vz;
+
+                // Apply damping
+                this.vx *= DAMPING;
+                this.vy *= DAMPING;
+                this.vz *= DAMPING;
+
+                // Ground collision - STRICT: never allow below ground
+                if (this.y >= GROUND_Y - VERTEX_RADIUS) {
+                    this.y = GROUND_Y - VERTEX_RADIUS;
+                    this.vy = Math.min(0, this.vy * -0.5); // Only bounce upward or stop
+                    this.vx *= 0.8;
+                    this.vz *= 0.8;
+                }
+            }
+
+            constrainToParent() {
+                if (this.parentId === null) return null;
+                
+                const parent = vertices.find(v => v.id === this.parentId);
+                if (!parent) return null;
+
+                const edgeKey = `${this.id}-${this.parentId}`;
+                if (brokenEdges.has(edgeKey)) return null;
+
+                const dx = this.x - parent.x;
+                const dy = this.y - parent.y;
+                const dz = this.z - parent.z;
+                const currentLength = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                
+                if (currentLength < 0.001) return null;
+
+                // Calculate tension force
+                const lengthDiff = currentLength - this.restLength;
+                const tension = Math.abs(lengthDiff) * (1.0 - this.lengthStiffness) * 10;
+                
+                // Check if edge should break
+                if (tension > this.breakForce) {
+                    brokenEdges.add(edgeKey);
+                    return { broken: true, force: tension };
+                }
+
+                // Apply length constraint
+                // lengthStiffness: 0 = rigid (exact length), 1 = no length constraint
+                if (this.lengthStiffness < 1.0) {
+                    const targetLength = this.restLength;
+                    const correctionFactor = (currentLength - targetLength) / currentLength;
+                    const strength = (1.0 - this.lengthStiffness) * 0.5;
+                    
+                    const correctionX = dx * correctionFactor * strength;
+                    const correctionY = dy * correctionFactor * strength;
+                    const correctionZ = dz * correctionFactor * strength;
+                    
+                    // Apply correction split by mass
+                    const totalMass = this.mass + parent.mass;
+                    const thisRatio = parent.mass / totalMass;
+                    const parentRatio = this.mass / totalMass;
+                    
+                    this.x -= correctionX * thisRatio;
+                    this.y -= correctionY * thisRatio;
+                    this.z -= correctionZ * thisRatio;
+                    
+                    parent.x += correctionX * parentRatio;
+                    parent.y += correctionY * parentRatio;
+                    parent.z += correctionZ * parentRatio;
+                }
+
+                // Apply range constraints
+                const constrainedDx = Math.max(-this.rangeX, Math.min(this.rangeX, dx));
+                const constrainedDy = Math.max(-this.rangeY, Math.min(this.rangeY, dy));
+                const constrainedDz = Math.max(-this.rangeZ, Math.min(this.rangeZ, dz));
+
+                // Soft spring force for range limits
+                if (Math.abs(dx) > this.rangeX || Math.abs(dy) > this.rangeY || Math.abs(dz) > this.rangeZ) {
+                    const targetX = parent.x + constrainedDx;
+                    const targetY = parent.y + constrainedDy;
+                    const targetZ = parent.z + constrainedDz;
+
+                    const forceFactor = this.stiffness;
+                    this.x += (targetX - this.x) * forceFactor;
+                    this.y += (targetY - this.y) * forceFactor;
+                    this.z += (targetZ - this.z) * forceFactor;
+                }
+
+                return { broken: false, force: tension };
+            }
+
+            resolveCollision(other) {
+                const dx = this.x - other.x;
+                const dy = this.y - other.y;
+                const dz = this.z - other.z;
+                const distSq = dx*dx + dy*dy + dz*dz;
+                const minDist = VERTEX_RADIUS * 2;
+                const minDistSq = minDist * minDist;
+
+                if (distSq < minDistSq && distSq > 0.001) {
+                    const dist = Math.sqrt(distSq);
+                    const overlap = minDist - dist;
+                    const nx = dx / dist;
+                    const ny = dy / dist;
+                    const nz = dz / dist;
+
+                    // Separate based on mass ratio
+                    const totalMass = this.mass + other.mass;
+                    const thisRatio = other.mass / totalMass;
+                    const otherRatio = this.mass / totalMass;
+
+                    const separationX = nx * overlap;
+                    const separationY = ny * overlap;
+                    const separationZ = nz * overlap;
+
+                    this.x += separationX * thisRatio;
+                    this.y += separationY * thisRatio;
+                    this.z += separationZ * thisRatio;
+
+                    other.x -= separationX * otherRatio;
+                    other.y -= separationY * otherRatio;
+                    other.z -= separationZ * otherRatio;
+
+                    // Apply collision impulse
+                    const relVelX = this.vx - other.vx;
+                    const relVelY = this.vy - other.vy;
+                    const relVelZ = this.vz - other.vz;
+                    const relVelDotN = relVelX * nx + relVelY * ny + relVelZ * nz;
+
+                    if (relVelDotN < 0) {
+                        const restitution = 0.3;
+                        const impulse = -(1 + restitution) * relVelDotN / totalMass;
+
+                        this.vx += impulse * other.mass * nx;
+                        this.vy += impulse * other.mass * ny;
+                        this.vz += impulse * other.mass * nz;
+
+                        other.vx -= impulse * this.mass * nx;
+                        other.vy -= impulse * this.mass * ny;
+                        other.vz -= impulse * this.mass * nz;
+                    }
+                }
+            }
+            
+            // Check collision against an edge between two vertices
+            checkEdgeCollision(v1, v2) {
+                // Vector from v1 to v2
+                const edgeX = v2.x - v1.x;
+                const edgeY = v2.y - v1.y;
+                const edgeZ = v2.z - v1.z;
+                const edgeLengthSq = edgeX*edgeX + edgeY*edgeY + edgeZ*edgeZ;
+                
+                if (edgeLengthSq < 0.001) return; // Edge too short
+                
+                // Vector from v1 to this vertex
+                const toVertexX = this.x - v1.x;
+                const toVertexY = this.y - v1.y;
+                const toVertexZ = this.z - v1.z;
+                
+                // Project onto edge to find closest point (clamped to edge)
+                let t = (toVertexX*edgeX + toVertexY*edgeY + toVertexZ*edgeZ) / edgeLengthSq;
+                t = Math.max(0, Math.min(1, t));
+                
+                // Closest point on edge
+                const closestX = v1.x + edgeX * t;
+                const closestY = v1.y + edgeY * t;
+                const closestZ = v1.z + edgeZ * t;
+                
+                // Distance to closest point
+                const dx = this.x - closestX;
+                const dy = this.y - closestY;
+                const dz = this.z - closestZ;
+                const distSq = dx*dx + dy*dy + dz*dz;
+                
+                // Wall edge is very thick (50 units radius) to catch everything
+                const wallThickness = 50;
+                const minDist = VERTEX_RADIUS + wallThickness;
+                const minDistSq = minDist * minDist;
+                
+                if (distSq < minDistSq && distSq > 0.001) {
+                    const dist = Math.sqrt(distSq);
+                    const overlap = minDist - dist;
+                    const nx = dx / dist;
+                    const ny = dy / dist;
+                    const nz = dz / dist;
+                    
+                    // Push vertex away from edge forcefully
+                    this.x += nx * overlap;
+                    this.y += ny * overlap;
+                    this.z += nz * overlap;
+                    
+                    // Apply velocity reflection and damping
+                    const velDotN = this.vx * nx + this.vy * ny + this.vz * nz;
+                    if (velDotN < 0) {
+                        const restitution = 0.3;
+                        this.vx -= (1 + restitution) * velDotN * nx;
+                        this.vy -= (1 + restitution) * velDotN * ny;
+                        this.vz -= (1 + restitution) * velDotN * nz;
+                    }
+                }
+            }
+
+            project() {
+                const scale = FOCAL_LENGTH / (CAMERA_DISTANCE + this.z);
+                return {
+                    x: this.x * scale + 300,
+                    y: this.y * scale + 200,
+                    visible: (CAMERA_DISTANCE + this.z) > 0,
+                    z: this.z
+                };
+            }
+        }
+
+        function initializeVertices() {
+            vertices = [];
+            
+            // Central hub of tripod (starting at left side of screen, moving right)
+            vertices.push(new Vertex(0, -200, -50, 0, null, 2.0, 0, 0, 0, 1.0, 1000, 0.0));
+            
+            // Three legs, each with 2 segments
+            // Leg 1 (front)
+            vertices.push(new Vertex(1, -150, 20, 60, 0, 1.5, 100, 100, 100, 0.7, 150, 0.0));
+            vertices.push(new Vertex(2, -100, 100, 80, 1, 1.5, 100, 100, 100, 0.6, 120, 0.1));
+            
+            // Leg 2 (back left)
+            vertices.push(new Vertex(3, -150, 20, -60, 0, 1.5, 100, 100, 100, 0.7, 150, 0.0));
+            vertices.push(new Vertex(4, -100, 100, -80, 3, 1.5, 100, 100, 100, 0.6, 120, 0.1));
+            
+            // Leg 3 (right)
+            vertices.push(new Vertex(5, -130, 30, 0, 0, 1.5, 100, 100, 100, 0.7, 150, 0.0));
+            vertices.push(new Vertex(6, -80, 110, 0, 5, 1.5, 100, 100, 100, 0.6, 120, 0.1));
+            
+            // Immovable wall - two vertices with minimal display
+            // Vertex 7 at top, vertex 8 at GROUND LEVEL (not below)
+            vertices.push(new Vertex(7, 150, -300, 0, null, 100000, 0, 0, 0, 1.0, 1000000, 0.0, true));
+            vertices.push(new Vertex(8, 150, GROUND_Y, 0, 7, 100000, 0, 1200, 0, 1.0, 1000000, 0.0, true));
+            
+            // Apply initial momentum to tripod (moving right towards stack) - INCREASED
+            for (let i = 0; i <= 6; i++) {
+                vertices[i].vx = 15.0; // Much stronger horizontal velocity to the right
+                vertices[i].vz = (Math.random() - 0.5) * 0.5; // Slight random z wobble
+            }
+            
+            // Calculate rest lengths after all vertices are created
+            for (let vertex of vertices) {
+                if (vertex.parentId !== null) {
+                    const parent = vertices.find(v => v.id === vertex.parentId);
+                    if (parent) {
+                        const dx = vertex.x - parent.x;
+                        const dy = vertex.y - parent.y;
+                        const dz = vertex.z - parent.z;
+                        vertex.restLength = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    }
+                }
+            }
+            
+            brokenEdges.clear();
+            frameNumber = 0;
+        }
+
+        function simulatePhysics() {
+            // Update all vertices
+            for (let vertex of vertices) {
+                vertex.update();
+            }
+
+            // Apply constraints multiple times for stability
+            const constraintResults = {};
+            for (let iteration = 0; iteration < 8; iteration++) {
+                // Length constraints
+                for (let vertex of vertices) {
+                    const result = vertex.constrainToParent();
+                    if (result) {
+                        constraintResults[vertex.id] = result;
+                    }
+                }
+                
+                // Edge collision for wall (vertices 7-8)
+                for (let i = 0; i <= 6; i++) {
+                    vertices[i].checkEdgeCollision(vertices[7], vertices[8]);
+                }
+                
+                // Self-collision detection and resolution
+                for (let i = 0; i < vertices.length; i++) {
+                    for (let j = i + 1; j < vertices.length; j++) {
+                        // Skip collision between parent-child pairs
+                        if (vertices[i].parentId === vertices[j].id || 
+                            vertices[j].parentId === vertices[i].id) {
+                            continue;
+                        }
+                        // Skip wall vertices colliding with each other
+                        if ((i === 7 || i === 8) && (j === 7 || j === 8)) {
+                            continue;
+                        }
+                        vertices[i].resolveCollision(vertices[j]);
+                    }
+                }
+                
+                // STRICT ground enforcement - never let any vertex go below ground
+                for (let vertex of vertices) {
+                    if (vertex.y > GROUND_Y - VERTEX_RADIUS) {
+                        vertex.y = GROUND_Y - VERTEX_RADIUS;
+                        if (vertex.vy > 0) vertex.vy = 0;
+                    }
+                }
+            }
+
+            return constraintResults;
+        }
+
+        function drawFrame(canvas, ctx, topCanvas, topCtx) {
+            // Main view
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw grid
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 600; i += 50) {
+                ctx.beginPath();
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i, 400);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(0, i);
+                ctx.lineTo(600, i);
+                ctx.stroke();
+            }
+
+            // Draw ground line
+            ctx.strokeStyle = '#ff6600';
+            ctx.lineWidth = 3;
+            const groundScreenY = GROUND_Y * FOCAL_LENGTH / CAMERA_DISTANCE + 200;
+            ctx.beginPath();
+            ctx.moveTo(0, groundScreenY);
+            ctx.lineTo(600, groundScreenY);
+            ctx.stroke();
+            
+            ctx.fillStyle = '#ff6600';
+            ctx.font = 'bold 14px monospace';
+            ctx.fillText('GROUND', 10, groundScreenY - 10);
+
+            // Project all vertices
+            const projected = vertices.map(v => ({
+                vertex: v,
+                proj: v.project()
+            }));
+
+            projected.sort((a, b) => b.proj.z - a.proj.z);
+
+            // Draw edges
+            for (let {vertex, proj} of projected) {
+                if (vertex.parentId !== null && proj.visible) {
+                    const parent = vertices.find(v => v.id === vertex.parentId);
+                    if (parent) {
+                        const parentProj = parent.project();
+                        if (parentProj.visible) {
+                            const edgeKey = `${vertex.id}-${vertex.parentId}`;
+                            const isBroken = brokenEdges.has(edgeKey);
+                            
+                            // Color by stiffness
+                            let edgeColor = '#4a9eff';
+                            if (!isBroken) {
+                                if (vertex.lengthStiffness === 0) edgeColor = '#ff4a9e'; // Rigid = pink
+                                else if (vertex.lengthStiffness < 0.3) edgeColor = '#9e4aff'; // Semi-rigid = purple
+                                else edgeColor = '#4a9eff'; // Flexible = blue
+                            }
+                            
+                            ctx.strokeStyle = isBroken ? '#ff4444' : edgeColor;
+                            ctx.lineWidth = isBroken ? 1 : 3;
+                            ctx.setLineDash(isBroken ? [5, 5] : []);
+                            ctx.beginPath();
+                            ctx.moveTo(proj.x, proj.y);
+                            ctx.lineTo(parentProj.x, parentProj.y);
+                            ctx.stroke();
+                            ctx.setLineDash([]);
+                        }
+                    }
+                }
+            }
+
+            // Draw vertices
+            for (let {vertex, proj} of projected) {
+                if (proj.visible) {
+                    // Calculate size based on distance (perspective)
+                    const scale = FOCAL_LENGTH / (CAMERA_DISTANCE + vertex.z);
+                    
+                    // Use minimal display for wall vertices, normal size for others
+                    let size;
+                    if (vertex.minimalDisplay) {
+                        size = 4; // Small fixed size for wall vertices
+                    } else {
+                        const baseSize = vertex.id === 0 ? 20 : (10 + vertex.mass * 0.001);
+                        size = baseSize * scale;
+                    }
+                    
+                    // Only draw if size is reasonable (not too far away)
+                    if (size > 0.5) {
+                        // Color tripod vs wall differently
+                        if (vertex.id <= 6) {
+                            ctx.fillStyle = vertex.parentId === null ? '#ff9944' : '#44ff99';
+                        } else {
+                            ctx.fillStyle = '#888888'; // Gray for immovable wall
+                        }
+                        
+                        ctx.beginPath();
+                        ctx.arc(proj.x, proj.y, size, 0, Math.PI * 2);
+                        ctx.fill();
+                        
+                        ctx.strokeStyle = '#fff';
+                        ctx.lineWidth = Math.max(1, 2 * scale);
+                        ctx.stroke();
+                        
+                        // Only draw label if vertex is reasonably sized and not minimal display
+                        if (size > 5 && !vertex.minimalDisplay) {
+                            ctx.fillStyle = '#000';
+                            ctx.font = `bold ${Math.max(8, 12 * scale)}px monospace`;
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                            ctx.fillText(vertex.id, proj.x, proj.y);
+                        }
+                    }
+                }
+            }
+
+            // Top view
+            topCtx.clearRect(0, 0, topCanvas.width, topCanvas.height);
+            
+            // Draw axes
+            topCtx.strokeStyle = '#666';
+            topCtx.lineWidth = 1;
+            topCtx.beginPath();
+            topCtx.moveTo(75, 0);
+            topCtx.lineTo(75, 150);
+            topCtx.stroke();
+            topCtx.beginPath();
+            topCtx.moveTo(0, 75);
+            topCtx.lineTo(150, 75);
+            topCtx.stroke();
+            
+            // Labels
+            topCtx.fillStyle = '#888';
+            topCtx.font = '10px monospace';
+            topCtx.fillText('X', 145, 80);
+            topCtx.fillText('Z', 80, 10);
+            
+            // Draw wall line in top view
+            topCtx.strokeStyle = '#ff4a9e';
+            topCtx.lineWidth = 3;
+            topCtx.beginPath();
+            topCtx.moveTo(150 * 0.3 + 75, -100 * 0.3 + 75);
+            topCtx.lineTo(150 * 0.3 + 75, 100 * 0.3 + 75);
+            topCtx.stroke();
+            
+            // Draw edges in top view
+            for (let vertex of vertices) {
+                if (vertex.parentId !== null) {
+                    const parent = vertices.find(v => v.id === vertex.parentId);
+                    if (parent) {
+                        const edgeKey = `${vertex.id}-${vertex.parentId}`;
+                        const isBroken = brokenEdges.has(edgeKey);
+                        
+                        // Skip wall edge
+                        if (vertex.id === 8) continue;
+                        
+                        topCtx.strokeStyle = isBroken ? '#ff4444' : '#4a9eff';
+                        topCtx.lineWidth = isBroken ? 1 : 2;
+                        topCtx.setLineDash(isBroken ? [3, 3] : []);
+                        topCtx.beginPath();
+                        topCtx.moveTo(vertex.x * 0.3 + 75, vertex.z * 0.3 + 75);
+                        topCtx.lineTo(parent.x * 0.3 + 75, parent.z * 0.3 + 75);
+                        topCtx.stroke();
+                        topCtx.setLineDash([]);
+                    }
+                }
+            }
+            
+            // Draw vertices in top view
+            for (let vertex of vertices) {
+                // Skip wall vertices
+                if (vertex.id === 7 || vertex.id === 8) continue;
+                
+                const size = vertex.id === 0 ? 8 : 5;
+                
+                // Color tripod vs wall differently
+                if (vertex.id <= 6) {
+                    topCtx.fillStyle = vertex.parentId === null ? '#ff9944' : '#44ff99';
+                } else {
+                    topCtx.fillStyle = '#888888';
+                }
+                
+                topCtx.beginPath();
+                topCtx.arc(vertex.x * 0.3 + 75, vertex.z * 0.3 + 75, size, 0, Math.PI * 2);
+                topCtx.fill();
+                
+                topCtx.strokeStyle = '#fff';
+                topCtx.lineWidth = 1;
+                topCtx.stroke();
+                
+                topCtx.fillStyle = '#fff';
+                topCtx.font = 'bold 10px monospace';
+                topCtx.textAlign = 'center';
+                topCtx.textBaseline = 'middle';
+                topCtx.fillText(vertex.id, vertex.x * 0.3 + 75, vertex.z * 0.3 + 75);
+            }
+        }
+
+        function generateStateInfo(constraintResults) {
+            let html = '<div class="stats">';
+            html += `Total Vertices: ${vertices.length}<br>`;
+            html += `Tripod Vertices: 7 (0-6) | Wall Vertices: 2 (7-8)<br>`;
+            html += `Broken Edges: ${brokenEdges.size}<br>`;
+            html += `Active Edges: ${vertices.filter(v => v.parentId !== null).length - brokenEdges.size}<br>`;
+            html += '</div><br>';
+
+            for (let vertex of vertices) {
+                html += `<div class="vertex-info">`;
+                html += `<strong>Vertex ${vertex.id}</strong> `;
+                
+                if (vertex.id <= 6) {
+                    html += `(TRIPOD - ${vertex.parentId !== null ? `child of ${vertex.parentId}` : 'HUB'})<br>`;
+                } else {
+                    html += `(WALL - IMMOVABLE)<br>`;
+                }
+                
+                html += `Position: (${vertex.x.toFixed(1)}, ${vertex.y.toFixed(1)}, ${vertex.z.toFixed(1)})<br>`;
+                html += `Velocity: (${vertex.vx.toFixed(2)}, ${vertex.vy.toFixed(2)}, ${vertex.vz.toFixed(2)})<br>`;
+                html += `Mass: ${vertex.mass.toFixed(1)} | Stiffness: ${vertex.stiffness.toFixed(2)}<br>`;
+                html += `Range: X±${vertex.rangeX} Y±${vertex.rangeY} Z±${vertex.rangeZ}<br>`;
+                html += `Minimal Display: ${vertex.minimalDisplay ? 'YES' : 'NO'}<br>`;
+                
+                if (vertex.parentId !== null) {
+                    const parent = vertices.find(v => v.id === vertex.parentId);
+                    const dx = vertex.x - parent.x;
+                    const dy = vertex.y - parent.y;
+                    const dz = vertex.z - parent.z;
+                    const currentLength = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    const lengthType = vertex.lengthStiffness === 0 ? 'RIGID' : 
+                                      vertex.lengthStiffness < 0.3 ? 'SEMI-RIGID' : 'FLEXIBLE';
+                    html += `Length: ${currentLength.toFixed(1)} (rest: ${vertex.restLength.toFixed(1)}) - ${lengthType}<br>`;
+                    html += `Length Stiffness: ${vertex.lengthStiffness.toFixed(2)}<br>`;
+                }
+                
+                html += `Break Force Threshold: ${vertex.breakForce}<br>`;
+                
+                if (constraintResults[vertex.id]) {
+                    const result = constraintResults[vertex.id];
+                    if (result.broken) {
+                        html += `<span class="broken-edge">⚠ EDGE BROKEN! Force: ${result.force.toFixed(1)}</span><br>`;
+                    } else {
+                        html += `Constraint Force: ${result.force.toFixed(1)}<br>`;
+                    }
+                }
+                
+                html += `</div>`;
+            }
+
+            return html;
+        }
+
+        function nextFrame() {
+            frameNumber++;
+            
+            const constraintResults = simulatePhysics();
+
+            const frameDiv = document.createElement('div');
+            frameDiv.className = 'frame';
+            
+            const header = document.createElement('div');
+            header.className = 'frame-header';
+            header.textContent = `Frame ${frameNumber}`;
+            frameDiv.appendChild(header);
+
+            const canvasContainer = document.createElement('div');
+            canvasContainer.className = 'canvas-container';
+
+            const canvas = document.createElement('canvas');
+            canvas.width = 600;
+            canvas.height = 400;
+            const ctx = canvas.getContext('2d');
+            
+            const topCanvas = document.createElement('canvas');
+            topCanvas.width = 150;
+            topCanvas.height = 150;
+            topCanvas.className = 'top-view';
+            const topCtx = topCanvas.getContext('2d');
+            
+            drawFrame(canvas, ctx, topCanvas, topCtx);
+            
+            canvasContainer.appendChild(canvas);
+            canvasContainer.appendChild(topCanvas);
+            frameDiv.appendChild(canvasContainer);
+
+            const stateDiv = document.createElement('div');
+            stateDiv.className = 'state-info';
+            stateDiv.innerHTML = generateStateInfo(constraintResults);
+            frameDiv.appendChild(stateDiv);
+
+            const framesContainer = document.getElementById('frames');
+            framesContainer.insertBefore(frameDiv, framesContainer.firstChild);
+
+            document.getElementById('frameCount').textContent = frameNumber;
+        }
+
+        function autoRun() {
+            for (let i = 0; i < 10; i++) {
+                setTimeout(() => nextFrame(), i * 100);
+            }
+        }
+
+        function reset() {
+            initializeVertices();
+            document.getElementById('frames').innerHTML = '';
+            document.getElementById('frameCount').textContent = '0';
+        }
+
+        // Initialize
+        initializeVertices();
+    </script>
+</body>
+</html>
